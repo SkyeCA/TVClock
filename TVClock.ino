@@ -11,24 +11,29 @@
 #define UP_BUTTON_PIN  15
 #define LMAP_COLLECTOR_PIN  5
 #define TV_COLLECTOR_PIN 4
+
 // EEPROM memory locations
 #define ALARM_HOUR_ADDR 0
 #define ALARM_MIN_ADDR 8
 #define ALARM_VOL_ADDR 16
 #define ALARM_SET_ADDR 24
 
-// EEPROM Mapping
-// 32 bits total
-// [8 bits][8 bits][8 bits][8 bits] 
-// 00010111 00111011 01100100 00000011  
-// 00010111 - 0-23 - Hour - uint8_t
-// 00111011 - 0-59 - Minute - uint8_t
-// 01100100 - 0-100 - Volume - uint8_t
-// 00000111 - bools - Alarm Enabled/Light Enabled - uint8_t
+struct ButtonState {
+  uint8_t pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastDebounceTime;
+};
+
+ButtonState tvBtn = {TV_BUTTON_PIN, LOW, LOW, 0};
+ButtonState setBtn = {SET_BUTTON_PIN, LOW, LOW, 0};
+ButtonState downBtn = {DOWN_BUTTON_PIN, LOW, LOW, 0};
+ButtonState upBtn = {UP_BUTTON_PIN, LOW, LOW, 0};
 
 TVout TV;
 uRTCLib rtc(0x68);
 DY::Player player(&Serial1);
+
 bool tvStateOn = false;
 bool lampStateOn = false;
 unsigned long tvStateChangedAt;
@@ -48,6 +53,14 @@ void setup() {
   URTCLIB_WIRE.begin();
   rtc.set_12hour_mode(false);
 
+  pinMode(TV_BUTTON_PIN, INPUT);
+  pinMode(SET_BUTTON_PIN, INPUT);
+  pinMode(DOWN_BUTTON_PIN, INPUT);
+  pinMode(UP_BUTTON_PIN, INPUT);
+  
+  pinMode(TV_COLLECTOR_PIN, OUTPUT);
+  pinMode(LMAP_COLLECTOR_PIN, OUTPUT);
+
   // Restore Settings
   loadSettings();
 
@@ -59,9 +72,28 @@ void setup() {
   TV.begin(_NTSC,80,30);
   TV.select_font(font8x8);
 
-  // TV on/off collector pin
-  pinMode(TV_COLLECTOR_PIN, OUTPUT);
   toggleTvOnOff();
+}
+
+bool isButtonPressed(ButtonState &btn) {
+  bool currentReading = digitalRead(btn.pin);
+  bool triggered = false;
+
+  if (currentReading != btn.lastReading) {
+    btn.lastDebounceTime = TV.millis();
+  }
+
+  if ((TV.millis() - btn.lastDebounceTime) > 50) {
+    if (currentReading != btn.stableState) {
+      btn.stableState = currentReading;
+      if (btn.stableState == HIGH) {
+        triggered = true;
+      }
+    }
+  }
+  
+  btn.lastReading = currentReading;
+  return triggered;
 }
 
 void toggleTvOnOff(){
@@ -103,101 +135,51 @@ bool shouldUpdateTime(){
 
 void displayAlarm(){
   char alarmBuf[20];
-
-  if(alarmHour < 10){
-    sprintf(alarmBuf, "%d%d:", 0, alarmHour);
-  } else {
-    sprintf(alarmBuf, "%d:", alarmHour);
-  }
-
-  if(alarmMinute < 10){
-    sprintf(alarmBuf + strlen(alarmBuf), "%d%d", 0, alarmMinute);
-  } else {
-    sprintf(alarmBuf + strlen(alarmBuf), "%d", alarmMinute);
-  }
-
-  if(alarmEnabled){
-    sprintf(alarmBuf + strlen(alarmBuf), " ON");
-  } else {
-    sprintf(alarmBuf + strlen(alarmBuf), " OFF");
-  }
-
-  TV.print(1,10,alarmBuf);
-  return;
+  sprintf(alarmBuf, "%02d:%02d %s", alarmHour, alarmMinute, alarmEnabled ? "ON" : "OFF");
+  TV.print(1, 10, alarmBuf);
 }
 
 void displayTime(){
-  uint8_t second = rtc.second();
-  uint8_t hour = rtc.hour();
-  uint8_t minute = rtc.minute();
   char timeBuf[20];
-
-  if(hour < 10){
-    sprintf(timeBuf, "%d%d:", 0, hour);
-  } else {
-    sprintf(timeBuf, "%d:", hour);
-  }
-
-  if(minute < 10){
-    sprintf(timeBuf + strlen(timeBuf), "%d%d:", 0, minute);
-  } else {
-    sprintf(timeBuf + strlen(timeBuf), "%d:", minute);
-  }
-
-  if(second < 10){
-    sprintf(timeBuf + strlen(timeBuf), "%d%d", 0, second);
-  } else {
-    sprintf(timeBuf + strlen(timeBuf), "%d", second);
-  }
-
-  TV.print(1,1,timeBuf);
-  return;
+  sprintf(timeBuf, "%02d:%02d:%02d", rtc.hour(), rtc.minute(), rtc.second());
+  TV.print(1, 1, timeBuf);
 }
 
-uint8_t incOrDecOnButtonPress(uint8_t val){
-  if (digitalRead(UP_BUTTON_PIN) == HIGH) {
-    return val + 1;
-  }
+uint8_t getBoundedTimeValueInput(const char* type, int minVal, int maxVal, int current){
+  int value = current;
+  char settingText[12];
+  char settingValue[4];
 
-  if (digitalRead(DOWN_BUTTON_PIN) == HIGH) {
-    return val - 1;
-  }
+  strcpy(settingText, "Set ");
+  strcat(settingText, type);
 
-  return val;
-}
-
-uint8_t getBoundedTimeValueInput(char* type, uint8_t min, uint8_t max, uint8_t current){
-  uint8_t value = current != NULL ? current : min;
-  char* str = "Set ";
-  char settingText[9];
-  char setingValue[4];
-
-  strcpy( settingText, str );
-  strcat( settingText, type );
-  itoa(value, setingValue, 10);
+  TV.clear_screen();
 
   while(true){
-    TV.clear_screen();
-    TV.print(1,1,settingText);
-    TV.print(10,10,setingValue);
-    value = incOrDecOnButtonPress(value);
-
-    if(value > max){
-      value = min;
-    }
-    if(value < min){
-      value = max;
-    }
-
-    itoa(value, setingValue, 10);
-    TV.delay(200);
+    TV.print(1, 1, settingText);
     
-    if (digitalRead(SET_BUTTON_PIN) == HIGH){
+    itoa(value, settingValue, 10);
+    TV.print(10, 10, settingValue);
+    TV.print("  ");
+
+    if (isButtonPressed(upBtn)) {
+      value++;
+      if (value > maxVal) value = minVal;
+      TV.clear_screen();
+    }
+
+    if (isButtonPressed(downBtn)) {
+      value--;
+      if (value < minVal) value = maxVal;
+      TV.clear_screen();
+    }
+
+    if (isButtonPressed(setBtn)) {
       break;
     }
   }
 
-  return value;
+  return (uint8_t)value;
 }
 
 void storeSettings(){
@@ -212,7 +194,6 @@ void storeSettings(){
 void loadSettings(){
   EEPROM.get(ALARM_SET_ADDR, alarmRawSettings);
 
-  //Sanity check incase this is the first run
   if(alarmRawSettings != 255){
     EEPROM.get(ALARM_HOUR_ADDR, alarmHour);
     EEPROM.get(ALARM_MIN_ADDR, alarmMinute);
@@ -222,7 +203,6 @@ void loadSettings(){
     return;
   }
 
-  // If check failed we'll write the defaults
   alarmRawSettings = 0;
   storeSettings();
 }
@@ -243,15 +223,15 @@ void settingsModeLoop(){
   alarmLightEnabled = alarmLightEnableNum == 1 ? true : false;
   player.setVolume(alarmVolume);
   storeSettings();
+  
   TV.delay(300);
   TV.clear_screen();
 }
 
-// Special alarm loop that doesn't update the screen while the alarm is playing.
-// Screen updates while playing cause audio interference and I don't know why.
 void alarmSoundingLoop(){
   player.playSpecifiedDevicePath(DY::Device::Flash, path);
   alarmOn = true;
+  unsigned long lastAlarmCheckTime = TV.millis();
 
   if(!lampStateOn && alarmLightEnabled){
     toggleLampOnOff();
@@ -262,72 +242,68 @@ void alarmSoundingLoop(){
   }
 
   TV.clear_screen();
-  TV.print(1,1,"ALARM!");
+  TV.print(1, 1, "ALARM!");
 
   while(alarmOn && !alarmSilenced){
-    if(rtc.minute() != alarmMinute && player.checkPlayState() != DY::PlayState::Playing){
-      alarmOn = false;
-      alarmSilenced = false;
+    if ((TV.millis() - lastAlarmCheckTime) > 1000) {
+      lastAlarmCheckTime = TV.millis();
+      rtc.refresh();
+
+      if(rtc.minute() != alarmMinute){
+         if(player.checkPlayState() != DY::PlayState::Playing){
+            alarmOn = false;
+            alarmSilenced = false;
+         }
+      }
     }
 
-    if(digitalRead(TV_BUTTON_PIN) == HIGH) {
+    if(isButtonPressed(tvBtn)) {
       player.stop();
       alarmOn = false;
       alarmSilenced = true;
     }
-
-    TV.delay(1000);
   }
 
   if(lampStateOn && alarmLightEnabled){
     toggleLampOnOff();
   }
 
+  TV.clear_screen();
   return;
 }
 
 void loop() {
   rtc.refresh();
 
-  // If the alarm is enabled, not on, not silenced, and it's the set alarm time, start the alarm loop
   if(alarmEnabled && !alarmOn && !alarmSilenced && rtc.hour() == alarmHour && rtc.minute() == alarmMinute){
     alarmSoundingLoop();
   }
 
-  // If alarm is silenced we need to detect that after the alarm time has passed or else it won't sound
-  // the next time it should occur.
   if(alarmSilenced && rtc.minute() != alarmMinute){
     alarmSilenced = false;
   }
 
-  // Turn TV on
-  if (digitalRead(TV_BUTTON_PIN) == HIGH) {
+  if (isButtonPressed(tvBtn)) {
     toggleTvOnOff();
   }
 
-  // Start Settings UI Loop
-  if (digitalRead(SET_BUTTON_PIN) == HIGH) {
+  if (isButtonPressed(setBtn)) {
     if(!tvStateOn){
       toggleTvOnOff();
     }
     settingsModeLoop();
   }
 
-  // Turn lamp on
-  if (digitalRead(DOWN_BUTTON_PIN) == HIGH) {
+  if (isButtonPressed(downBtn)) {
     toggleLampOnOff();
   }
 
-  // Turn TV off automatically to preserve tube life
   if (tvStateOn && TV.millis() - tvStateChangedAt >= 30000) {
     toggleTvOnOff();
   }
 
-  // Only upadte TV display if the TV is actually turned on
   if(shouldUpdateTime() && tvStateOn){
     displayTime();
     displayAlarm();
   }
-
-  TV.delay(300);
 }
